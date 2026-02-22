@@ -1,6 +1,7 @@
 package main
 
 import (
+	"console-viz/collector"
 	"console-viz/draw"
 	"console-viz/styling"
 	"console-viz/widgets"
@@ -14,11 +15,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time" // needed for the refresh ticker (e.g. fetch metrics every 15s)
 )
 
 // Config holds CLI configuration
 type Config struct {
 	DataFile   string
+	MetricsURL string   // when set, use metrics mode (sparkline from Windows Exporter instead of file)
 	Layout     string
 	Columns    string
 	Rows       string
@@ -112,6 +115,30 @@ func parseLayout(layoutStr string, widgetCount int) ([]float64, error) {
 		ratios[i] = ratio
 	}
 	return ratios, nil
+}
+
+// applyLayout sets each widget's rectangle from width, height, and ratios so we can reuse it at startup and on resize.
+func applyLayout(width, height int, ratios []float64, widgetList []draw.Drawable) {
+	// currentX tracks the left edge of the next widget (we lay out left-to-right)
+	currentX := 0
+	// assign each widget a horizontal slice of the terminal based on its ratio
+	for i, widget := range widgetList {
+		// widget width = terminal width * this widget's ratio
+		widgetWidth := int(float64(width) * ratios[i])
+		// set widget rect: left, top, right, bottom (height-1 to leave room for status if needed)
+		widget.SetRect(currentX, 0, currentX+widgetWidth, height-1)
+		// next widget starts where this one ends
+		currentX += widgetWidth
+	}
+}
+
+// truncateError shortens long error strings so they fit in the plot title
+func truncateError(s string) string {
+	const maxLen = 50
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 // parseColumnSpec parses column specification like "1-3" or "name,value" or "1,3,5"
@@ -651,6 +678,7 @@ func main() {
 	// Parse flags
 	var widgetStr string
 	flag.StringVar(&config.DataFile, "file", "", "Data file path (CSV, JSON, TXT)")
+	flag.StringVar(&config.MetricsURL, "metrics-url", "", "Metrics URL (e.g. http://localhost:9182/metrics); when set, show sparkline from Windows Exporter instead of file")
 	flag.StringVar(&widgetStr, "widget", "table", "Widget type: table, barchart, horizontal, horizontal-barchart, plot, sparkline, list (comma-separated for multiple)")
 	flag.StringVar(&config.Layout, "layout", "", "Layout ratios: '80:20' or 'barchart:80,plot:20'")
 	flag.StringVar(&config.Columns, "columns", "", "Column selection: '1-3' or 'name,value'")
@@ -667,8 +695,9 @@ func main() {
 		config.DataFile = flag.Args()[0]
 	}
 
-	if config.DataFile == "" {
-		fmt.Fprintf(os.Stderr, "Usage: console-viz <data-file> [options]\n")
+	// require either DataFile or MetricsURL (metrics mode)
+	if config.DataFile == "" && config.MetricsURL == "" {
+		fmt.Fprintf(os.Stderr, "Usage: console-viz <data-file> [options] OR console-viz --metrics-url=http://localhost:9182/metrics [options]\n")
 		fmt.Fprintf(os.Stderr, "\nOptions:\n")
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -699,59 +728,86 @@ func main() {
 
 	draw.InitRenderer()
 
-	// Detect file format
-	ext := strings.ToLower(filepath.Ext(config.DataFile))
-	if config.Format == "" {
-		config.Format = ext[1:] // Remove dot
-	}
+	// metrics mode: plot (line graph) from Windows Exporter (live data every 15s)
+	var metricsPlot *widgets.Plot
+	// one history per core so each core gets its own line (e.g. cores 0,0 and 0,1 = 2 lines)
+	var frequencyHistories [][]float64
+	var lastMetricsError string // show last fetch error in UI so user sees it when something goes wrong
+	maxHistory := 120           // keep last 120 points (2 hours at 15s interval)
 
-	// Load data
-	var data interface{}
-	var err error
-
-	switch config.Format {
-	case "csv":
-		data, err = loadCSV(config.DataFile, config)
-		if err != nil {
-			log.Fatalf("Failed to load CSV: %v", err)
+	// branch: metrics mode vs file mode
+	var widgetList []draw.Drawable
+	if config.MetricsURL != "" {
+		// metrics mode: plot grows with number of cores (add cores in collector coresToTrack = no other code change)
+		plot := widgets.NewPlot()
+		plot.Data = [][]float64{} // filled from snapshot.Cores; one inner slice per core = one line per core
+		plot.ShowAxes = true
+		plot.PlotType = widgets.LineChart
+		// use full palette so any number of cores gets distinct colors (cycles after 7)
+		plot.LineColors = styling.StandardColors
+		if config.Title != "" {
+			plot.Title = config.Title
+		} else {
+			plot.Title = "CPU frequency MHz"
 		}
-	case "json":
-		data, err = loadJSON(config.DataFile)
-		if err != nil {
-			log.Fatalf("Failed to load JSON: %v", err)
-		}
-	default:
-		log.Fatalf("Unsupported format: %s", config.Format)
-	}
-
-	// Parse widgets (normalize to lowercase so "Horizontal-Barchart" matches)
-	widgetTypes := []string{}
-	if widgetStr != "" {
-		widgetTypes = strings.Split(widgetStr, ",")
-		for i := range widgetTypes {
-			widgetTypes[i] = strings.TrimSpace(strings.ToLower(widgetTypes[i]))
-		}
+		metricsPlot = plot
+		widgetList = []draw.Drawable{metricsPlot}
 	} else {
-		widgetTypes = []string{"table"}
-	}
-
-	// Debug: Print what widget was requested
-	if len(os.Getenv("DEBUG")) > 0 {
-		log.Printf("DEBUG: Requested widget(s): %v", widgetTypes)
-		log.Printf("DEBUG: widgetStr value: '%s'", widgetStr)
-	}
-
-	// Create widgets
-	widgetList := []draw.Drawable{}
-	for _, widgetType := range widgetTypes {
-		widget, err := createWidget(widgetType, data, config)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: Failed to create widget '%s': %v\n", widgetType, err)
-			fmt.Fprintf(os.Stderr, "Available widgets: table, barchart, horizontal, horizontal-barchart, plot, sparkline, list\n")
-			fmt.Fprintf(os.Stderr, "\nTip: Make sure your data contains numeric values for chart widgets.\n")
-			os.Exit(1)
+		// file mode: existing logic (load file, create widgets from file data)
+		// Detect file format
+		ext := strings.ToLower(filepath.Ext(config.DataFile))
+		if config.Format == "" {
+			config.Format = ext[1:] // Remove dot
 		}
-		widgetList = append(widgetList, widget)
+
+		// Load data
+		var data interface{}
+		var err error
+
+		switch config.Format {
+		case "csv":
+			data, err = loadCSV(config.DataFile, config)
+			if err != nil {
+				log.Fatalf("Failed to load CSV: %v", err)
+			}
+		case "json":
+			data, err = loadJSON(config.DataFile)
+			if err != nil {
+				log.Fatalf("Failed to load JSON: %v", err)
+			}
+		default:
+			log.Fatalf("Unsupported format: %s", config.Format)
+		}
+
+		// Parse widgets (normalize to lowercase so "Horizontal-Barchart" matches)
+		widgetTypes := []string{}
+		if widgetStr != "" {
+			widgetTypes = strings.Split(widgetStr, ",")
+			for i := range widgetTypes {
+				widgetTypes[i] = strings.TrimSpace(strings.ToLower(widgetTypes[i]))
+			}
+		} else {
+			widgetTypes = []string{"table"}
+		}
+
+		// Debug: Print what widget was requested
+		if len(os.Getenv("DEBUG")) > 0 {
+			log.Printf("DEBUG: Requested widget(s): %v", widgetTypes)
+			log.Printf("DEBUG: widgetStr value: '%s'", widgetStr)
+		}
+
+		// Create widgets
+		widgetList = []draw.Drawable{}
+		for _, widgetType := range widgetTypes {
+			widget, err := createWidget(widgetType, data, config)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: Failed to create widget '%s': %v\n", widgetType, err)
+				fmt.Fprintf(os.Stderr, "Available widgets: table, barchart, horizontal, horizontal-barchart, plot, sparkline, list\n")
+				fmt.Fprintf(os.Stderr, "\nTip: Make sure your data contains numeric values for chart widgets.\n")
+				os.Exit(1)
+			}
+			widgetList = append(widgetList, widget)
+		}
 	}
 	
 	if len(widgetList) == 0 {
@@ -768,24 +824,101 @@ func main() {
 		}
 	}
 
-	// Get terminal dimensions
+	// Get terminal dimensions for initial layout
 	width, height := draw.TerminalDimensions()
+	// use shared helper so we can re-run the same layout on resize
+	applyLayout(width, height, ratios, widgetList)
 
-	// Position widgets based on ratios
-	currentX := 0
-	for i, widget := range widgetList {
-		widgetWidth := int(float64(width) * ratios[i])
-		widget.SetRect(currentX, 0, currentX+widgetWidth, height-1)
-		currentX += widgetWidth
+	// Clear screen with theme background (so --theme=dark gives full dark mode)
+	draw.Clear()
+
+	// if metrics mode: do initial fetch immediately so graph shows data right away (don't wait 15s)
+	if metricsPlot != nil {
+		snapshot, err := collector.FetchCPUFrequency(config.MetricsURL)
+		if err != nil {
+			lastMetricsError = err.Error()
+			log.Printf("initial metrics fetch: %v", err)
+			// show error in plot title so it's visible on screen (not just in log)
+			metricsPlot.Title = "core 0,0 MHz | Error: " + truncateError(lastMetricsError)
+		} else {
+			lastMetricsError = ""
+			if len(snapshot.Cores) > 0 {
+				// ensure we have one history slice per core (supports 0,0 and 0,1 etc.)
+				for len(frequencyHistories) < len(snapshot.Cores) {
+					frequencyHistories = append(frequencyHistories, nil)
+				}
+				for i := range snapshot.Cores {
+					frequencyHistories[i] = append(frequencyHistories[i], snapshot.Cores[i].Mhz)
+				}
+				metricsPlot.Data = frequencyHistories // one inner slice per core = one line per core
+			}
+		}
 	}
 
-	// Render
+	// Render once before entering the event loop (in metrics mode: shows first data point; in file mode: shows file data)
 	draw.Render(widgetList...)
 
-	// Event loop
-	for e := range draw.PollEvents() {
-		if e.Type == draw.KeyboardEvent && e.ID == "<Escape>" {
-			break
+	// Refresh interval for live data (e.g. fetch metrics every 15s)
+	ticker := time.NewTicker(15 * time.Second)
+	// stop the ticker when we exit so we don't leak it
+	defer ticker.Stop()
+
+	// Event loop: react to keyboard, resize, and timer (for future metrics fetch + graph update)
+	eventCh := draw.PollEvents()
+	for {
+		select {
+		// user input or terminal resize
+		case e := <-eventCh:
+			// quit on Escape
+			if e.Type == draw.KeyboardEvent && e.ID == "<Escape>" {
+				return
+			}
+			// on terminal resize: update renderer size, reapply layout, clear and redraw
+			if e.Type == draw.ResizeEvent {
+				// event payload has new width and height
+				r := e.Payload.(draw.Resize)
+				// tell the renderer the terminal size changed so its frame buffer is correct
+				draw.ResizeRenderer(r.Width, r.Height)
+				// recompute widget rectangles for the new size
+				applyLayout(r.Width, r.Height, ratios, widgetList)
+				// clear screen then redraw so resized layout looks correct
+				draw.Clear()
+				draw.Render(widgetList...)
+			}
+		// every 15s: fetch metrics from Windows Exporter then redraw (graph update in real time)
+		case <-ticker.C:
+			if metricsPlot != nil {
+				// metrics mode: fetch snapshot, append frequency to history, update plot Data, then Render
+				snapshot, err := collector.FetchCPUFrequency(config.MetricsURL)
+				if err != nil {
+					lastMetricsError = err.Error()
+					log.Printf("metrics fetch: %v", err)
+					// show error in plot title so user sees it in terminal
+					metricsPlot.Title = "core 0,0 MHz | Error: " + truncateError(lastMetricsError)
+				} else {
+					lastMetricsError = ""
+					if len(snapshot.Cores) > 0 {
+						// ensure one history per core (in case coresToTrack was increased)
+						for len(frequencyHistories) < len(snapshot.Cores) {
+							frequencyHistories = append(frequencyHistories, nil)
+						}
+						for i := range snapshot.Cores {
+							frequencyHistories[i] = append(frequencyHistories[i], snapshot.Cores[i].Mhz)
+							if len(frequencyHistories[i]) > maxHistory {
+								frequencyHistories[i] = frequencyHistories[i][len(frequencyHistories[i])-maxHistory:]
+							}
+						}
+						metricsPlot.Data = frequencyHistories // one line per core
+					}
+					if config.Title != "" {
+						metricsPlot.Title = config.Title
+					} else {
+						metricsPlot.Title = "CPU frequency MHz"
+					}
+				}
+			}
+			// redraw so terminal graph updates every 15s (in metrics mode: shows new frequency point; in file mode: just refreshes)
+			draw.Render(widgetList...)
 		}
 	}
 }

@@ -156,26 +156,41 @@ func (p *Plot) renderDot(buf *draw.Buffer, drawArea image.Rectangle, maxVal floa
 	}
 }
 
-// drawLine draws a line between two points
+// drawLine draws a line between two points using the same dot rune as the data points,
+// so the graph looks like connected dots (thin line), not thick bars.
 func (p *Plot) drawLine(buf *draw.Buffer, p1, p2 image.Point, color styling.Color) {
 	dx := utils.AbsInt(p2.X - p1.X)
 	dy := utils.AbsInt(p2.Y - p1.Y)
-
+	dotRune := p.DotMarkerRune // same as data points so line looks like connected dots
 	if dx > dy {
-		// Horizontal line
+		// Mostly horizontal: iterate x, compute y
 		startX := utils.MinInt(p1.X, p2.X)
 		endX := utils.MaxInt(p1.X, p2.X)
+		denom := p2.X - p1.X
+		if denom == 0 {
+			return
+		}
 		for x := startX; x <= endX; x++ {
-			y := p1.Y + (p2.Y-p1.Y)*(x-p1.X)/(p2.X-p1.X)
-			buf.SetCell(draw.NewCell(p.DotMarkerRune, styling.NewStyle(color)), image.Pt(x, y))
+			y := p1.Y + (p2.Y-p1.Y)*(x-p1.X)/denom
+			pt := image.Pt(x, y)
+			if pt.In(buf.Rectangle) {
+				buf.SetCell(draw.NewCell(dotRune, styling.NewStyle(color)), pt)
+			}
 		}
 	} else {
-		// Vertical line
+		// Mostly vertical: iterate y, compute x
 		startY := utils.MinInt(p1.Y, p2.Y)
 		endY := utils.MaxInt(p1.Y, p2.Y)
+		denom := p2.Y - p1.Y
+		if denom == 0 {
+			return
+		}
 		for y := startY; y <= endY; y++ {
-			x := p1.X + (p2.X-p1.X)*(y-p1.Y)/(p2.Y-p1.Y)
-			buf.SetCell(draw.NewCell(p.DotMarkerRune, styling.NewStyle(color)), image.Pt(x, y))
+			x := p1.X + (p2.X-p1.X)*(y-p1.Y)/denom
+			pt := image.Pt(x, y)
+			if pt.In(buf.Rectangle) {
+				buf.SetCell(draw.NewCell(dotRune, styling.NewStyle(color)), pt)
+			}
 		}
 	}
 }
