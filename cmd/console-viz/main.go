@@ -21,7 +21,8 @@ import (
 // Config holds CLI configuration
 type Config struct {
 	DataFile   string
-	MetricsURL string   // when set, use metrics mode (sparkline from Windows Exporter instead of file)
+	MetricsURL string   // when set, use metrics mode
+	Metrics    []string // metric selectors for generic graphing (e.g. go_gc_duration_seconds{quantile="0"}); repeatable
 	Layout     string
 	Columns    string
 	Rows       string
@@ -139,6 +140,16 @@ func truncateError(s string) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// stringSlice allows repeatable -metric flags (implements flag.Value)
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
 
 // parseColumnSpec parses column specification like "1-3" or "name,value" or "1,3,5"
@@ -678,7 +689,9 @@ func main() {
 	// Parse flags
 	var widgetStr string
 	flag.StringVar(&config.DataFile, "file", "", "Data file path (CSV, JSON, TXT)")
-	flag.StringVar(&config.MetricsURL, "metrics-url", "", "Metrics URL (e.g. http://localhost:9182/metrics); when set, show sparkline from Windows Exporter instead of file")
+	flag.StringVar(&config.MetricsURL, "metrics-url", "", "Metrics URL (e.g. http://localhost:9182/metrics)")
+	var metricSelectors stringSlice
+	flag.Var(&metricSelectors, "metric", "Metric selector to graph (repeatable), e.g. go_gc_duration_seconds{quantile=\"0\"}; all appear on same graph")
 	flag.StringVar(&widgetStr, "widget", "table", "Widget type: table, barchart, horizontal, horizontal-barchart, plot, sparkline, list (comma-separated for multiple)")
 	flag.StringVar(&config.Layout, "layout", "", "Layout ratios: '80:20' or 'barchart:80,plot:20'")
 	flag.StringVar(&config.Columns, "columns", "", "Column selection: '1-3' or 'name,value'")
@@ -689,17 +702,22 @@ func main() {
 	flag.StringVar(&config.Title, "title", "", "Widget title")
 	flag.StringVar(&config.Format, "format", "", "Force format: csv, json, txt")
 	flag.Parse()
+	config.Metrics = []string(metricSelectors)
 
 	// Get data file from args if not in flag
 	if config.DataFile == "" && len(flag.Args()) > 0 {
 		config.DataFile = flag.Args()[0]
 	}
 
-	// require either DataFile or MetricsURL (metrics mode)
 	if config.DataFile == "" && config.MetricsURL == "" {
-		fmt.Fprintf(os.Stderr, "Usage: console-viz <data-file> [options] OR console-viz --metrics-url=http://localhost:9182/metrics [options]\n")
+		fmt.Fprintf(os.Stderr, "Usage: console-viz <data-file> [options] OR console-viz --metrics-url=URL [options]\n")
+		fmt.Fprintf(os.Stderr, "       With custom metrics: --metrics-url=URL --metric 'name{label=\"val\"}' (repeat -metric for more lines)\n")
 		fmt.Fprintf(os.Stderr, "\nOptions:\n")
 		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	if len(config.Metrics) > 0 && config.MetricsURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: --metric requires --metrics-url\n")
 		os.Exit(1)
 	}
 
@@ -728,25 +746,27 @@ func main() {
 
 	draw.InitRenderer()
 
-	// metrics mode: plot (line graph) from Windows Exporter (live data every 15s)
+	// metrics mode: plot (line graph) from metrics URL
 	var metricsPlot *widgets.Plot
-	// one history per core so each core gets its own line (e.g. cores 0,0 and 0,1 = 2 lines)
-	var frequencyHistories [][]float64
-	var lastMetricsError string // show last fetch error in UI so user sees it when something goes wrong
-	maxHistory := 120           // keep last 120 points (2 hours at 15s interval)
+	var frequencyHistories [][]float64 // CPU frequency mode (no -metric): one history per core
+	var genericHistories [][]float64   // generic -metric mode: one history per metric selector
+	useGenericMetrics := len(config.Metrics) > 0
+	var lastMetricsError string
+	maxHistory := 120
 
 	// branch: metrics mode vs file mode
 	var widgetList []draw.Drawable
 	if config.MetricsURL != "" {
-		// metrics mode: plot grows with number of cores (add cores in collector coresToTrack = no other code change)
 		plot := widgets.NewPlot()
-		plot.Data = [][]float64{} // filled from snapshot.Cores; one inner slice per core = one line per core
+		plot.Data = [][]float64{}
 		plot.ShowAxes = true
 		plot.PlotType = widgets.LineChart
-		// use full palette so any number of cores gets distinct colors (cycles after 7)
 		plot.LineColors = styling.StandardColors
 		if config.Title != "" {
 			plot.Title = config.Title
+		} else if useGenericMetrics {
+			plot.Title = "Metrics"
+			plot.DataLabels = config.Metrics // legend on the right: each --metric appears with its line color
 		} else {
 			plot.Title = "CPU frequency MHz"
 		}
@@ -832,25 +852,41 @@ func main() {
 	// Clear screen with theme background (so --theme=dark gives full dark mode)
 	draw.Clear()
 
-	// if metrics mode: do initial fetch immediately so graph shows data right away (don't wait 15s)
+	// if metrics mode: do initial fetch immediately so graph shows data right away
 	if metricsPlot != nil {
-		snapshot, err := collector.FetchCPUFrequency(config.MetricsURL)
-		if err != nil {
-			lastMetricsError = err.Error()
-			log.Printf("initial metrics fetch: %v", err)
-			// show error in plot title so it's visible on screen (not just in log)
-			metricsPlot.Title = "core 0,0 MHz | Error: " + truncateError(lastMetricsError)
+		if useGenericMetrics {
+			snapshot, err := collector.FetchGenericMetrics(config.MetricsURL, config.Metrics)
+			if err != nil {
+				lastMetricsError = err.Error()
+				log.Printf("initial metrics fetch: %v", err)
+				metricsPlot.Title = "Metrics | Error: " + truncateError(lastMetricsError)
+			} else {
+				lastMetricsError = ""
+				for len(genericHistories) < len(snapshot.Values) {
+					genericHistories = append(genericHistories, nil)
+				}
+				for i := range snapshot.Values {
+					genericHistories[i] = append(genericHistories[i], snapshot.Values[i])
+				}
+				metricsPlot.Data = genericHistories
+			}
 		} else {
-			lastMetricsError = ""
-			if len(snapshot.Cores) > 0 {
-				// ensure we have one history slice per core (supports 0,0 and 0,1 etc.)
-				for len(frequencyHistories) < len(snapshot.Cores) {
-					frequencyHistories = append(frequencyHistories, nil)
+			snapshot, err := collector.FetchCPUFrequency(config.MetricsURL)
+			if err != nil {
+				lastMetricsError = err.Error()
+				log.Printf("initial metrics fetch: %v", err)
+				metricsPlot.Title = "core 0,0 MHz | Error: " + truncateError(lastMetricsError)
+			} else {
+				lastMetricsError = ""
+				if len(snapshot.Cores) > 0 {
+					for len(frequencyHistories) < len(snapshot.Cores) {
+						frequencyHistories = append(frequencyHistories, nil)
+					}
+					for i := range snapshot.Cores {
+						frequencyHistories[i] = append(frequencyHistories[i], snapshot.Cores[i].Mhz)
+					}
+					metricsPlot.Data = frequencyHistories
 				}
-				for i := range snapshot.Cores {
-					frequencyHistories[i] = append(frequencyHistories[i], snapshot.Cores[i].Mhz)
-				}
-				metricsPlot.Data = frequencyHistories // one inner slice per core = one line per core
 			}
 		}
 	}
@@ -888,32 +924,55 @@ func main() {
 		// every 15s: fetch metrics from Windows Exporter then redraw (graph update in real time)
 		case <-ticker.C:
 			if metricsPlot != nil {
-				// metrics mode: fetch snapshot, append frequency to history, update plot Data, then Render
-				snapshot, err := collector.FetchCPUFrequency(config.MetricsURL)
-				if err != nil {
-					lastMetricsError = err.Error()
-					log.Printf("metrics fetch: %v", err)
-					// show error in plot title so user sees it in terminal
-					metricsPlot.Title = "core 0,0 MHz | Error: " + truncateError(lastMetricsError)
-				} else {
-					lastMetricsError = ""
-					if len(snapshot.Cores) > 0 {
-						// ensure one history per core (in case coresToTrack was increased)
-						for len(frequencyHistories) < len(snapshot.Cores) {
-							frequencyHistories = append(frequencyHistories, nil)
+				if useGenericMetrics {
+					snapshot, err := collector.FetchGenericMetrics(config.MetricsURL, config.Metrics)
+					if err != nil {
+						lastMetricsError = err.Error()
+						log.Printf("metrics fetch: %v", err)
+						metricsPlot.Title = "Metrics | Error: " + truncateError(lastMetricsError)
+					} else {
+						lastMetricsError = ""
+						for len(genericHistories) < len(snapshot.Values) {
+							genericHistories = append(genericHistories, nil)
 						}
-						for i := range snapshot.Cores {
-							frequencyHistories[i] = append(frequencyHistories[i], snapshot.Cores[i].Mhz)
-							if len(frequencyHistories[i]) > maxHistory {
-								frequencyHistories[i] = frequencyHistories[i][len(frequencyHistories[i])-maxHistory:]
+						for i := range snapshot.Values {
+							genericHistories[i] = append(genericHistories[i], snapshot.Values[i])
+							if len(genericHistories[i]) > maxHistory {
+								genericHistories[i] = genericHistories[i][len(genericHistories[i])-maxHistory:]
 							}
 						}
-						metricsPlot.Data = frequencyHistories // one line per core
+						metricsPlot.Data = genericHistories
+						if config.Title != "" {
+							metricsPlot.Title = config.Title
+						} else {
+							metricsPlot.Title = "Metrics"
+						}
 					}
-					if config.Title != "" {
-						metricsPlot.Title = config.Title
+				} else {
+					snapshot, err := collector.FetchCPUFrequency(config.MetricsURL)
+					if err != nil {
+						lastMetricsError = err.Error()
+						log.Printf("metrics fetch: %v", err)
+						metricsPlot.Title = "core 0,0 MHz | Error: " + truncateError(lastMetricsError)
 					} else {
-						metricsPlot.Title = "CPU frequency MHz"
+						lastMetricsError = ""
+						if len(snapshot.Cores) > 0 {
+							for len(frequencyHistories) < len(snapshot.Cores) {
+								frequencyHistories = append(frequencyHistories, nil)
+							}
+							for i := range snapshot.Cores {
+								frequencyHistories[i] = append(frequencyHistories[i], snapshot.Cores[i].Mhz)
+								if len(frequencyHistories[i]) > maxHistory {
+									frequencyHistories[i] = frequencyHistories[i][len(frequencyHistories[i])-maxHistory:]
+								}
+							}
+							metricsPlot.Data = frequencyHistories
+						}
+						if config.Title != "" {
+							metricsPlot.Title = config.Title
+						} else {
+							metricsPlot.Title = "CPU frequency MHz"
+						}
 					}
 				}
 			}

@@ -13,6 +13,7 @@ const (
 	yAxisLabelsWidth  = 4
 	xAxisLabelsGap    = 2
 	yAxisLabelsGap    = 1
+	legendWidth       = 28 // width reserved for legend on the right (color + label per series)
 )
 
 // PlotType defines the type of plot
@@ -214,7 +215,7 @@ func (p *Plot) Draw(buf *draw.Buffer) {
 		p.plotAxes(buf, maxVal)
 	}
 
-	// Calculate draw area
+	// Calculate draw area (shrink from right if we have a legend)
 	drawArea := p.Inner
 	if p.ShowAxes {
 		drawArea = image.Rect(
@@ -224,13 +225,37 @@ func (p *Plot) Draw(buf *draw.Buffer) {
 			p.Inner.Max.Y-xAxisLabelsHeight-1,
 		)
 	}
+	if len(p.DataLabels) > 0 && drawArea.Dx() > legendWidth {
+		drawArea.Max.X -= legendWidth
+	}
 
 	// Render based on marker type
 	switch p.Marker {
 	case MarkerBraille:
-		// Braille rendering requires Canvas - fallback to dot
 		p.renderDot(buf, drawArea, maxVal)
 	case MarkerDot:
 		p.renderDot(buf, drawArea, maxVal)
+	}
+
+	// Legend on the right: color dot + label per series (when DataLabels set, e.g. for --metric mode)
+	if len(p.DataLabels) > 0 && p.Inner.Dx() > legendWidth {
+		legendMinX := p.Inner.Max.X - legendWidth
+		legendRect := image.Rect(legendMinX, p.Inner.Min.Y, p.Inner.Max.X, p.Inner.Max.Y)
+		p.drawLegend(buf, legendRect)
+	}
+}
+
+// drawLegend draws a legend in the given rect: one line per series with color dot and truncated label.
+func (p *Plot) drawLegend(buf *draw.Buffer, legendRect image.Rectangle) {
+	labelWidth := legendWidth - 3 // leave 3 chars for " • " or " ▸ "
+	for i := 0; i < len(p.Data) && i < len(p.DataLabels); i++ {
+		y := legendRect.Min.Y + i*2
+		if y >= legendRect.Max.Y {
+			break
+		}
+		color := utils.SelectColor(p.LineColors, i)
+		buf.SetCell(draw.NewCell(p.DotMarkerRune, styling.NewStyle(color)), image.Pt(legendRect.Min.X, y))
+		label := utils.TrimString(p.DataLabels[i], labelWidth)
+		buf.SetString(label, styling.NewStyle(p.AxesColor), image.Pt(legendRect.Min.X+2, y))
 	}
 }

@@ -120,3 +120,66 @@ func parseCPUFrequencyMetric(text string) ([]CoreFrequency, error) {
 	}
 	return out, nil
 }
+
+// GenericSnapshot holds one value per metric selector for a single scrape (for user-specified metrics).
+type GenericSnapshot struct {
+	Time   time.Time
+	Values []float64 // len(Values) == len(selectors); Values[i] = value for selectors[i], or 0 if no match
+}
+
+// FetchGenericMetrics fetches metrics from the URL and returns one value per selector.
+// Each selector is a Prometheus metric selector, e.g. go_gc_duration_seconds{quantile="0"}.
+// Multiple selectors => multiple series on the same graph.
+func FetchGenericMetrics(metricsURL string, selectors []string) (*GenericSnapshot, error) {
+	if len(selectors) == 0 {
+		return &GenericSnapshot{Time: time.Now(), Values: nil}, nil
+	}
+	now := time.Now()
+	resp, err := http.Get(metricsURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch metrics: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch metrics: status %s", resp.Status)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read metrics body: %w", err)
+	}
+	text := string(body)
+	values := parseGenericMetrics(text, selectors)
+	return &GenericSnapshot{Time: now, Values: values}, nil
+}
+
+// parseGenericMetrics matches each line against selectors; returns one value per selector (0 if no match).
+// Selector must match exactly as on the page (e.g. windows_memory_physical_total_bytes or name{label="val"}).
+func parseGenericMetrics(text string, selectors []string) []float64 {
+	values := make([]float64, len(selectors))
+	matched := make([]bool, len(selectors))
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.LastIndex(line, " ")
+		if idx == -1 {
+			continue
+		}
+		valueStr := strings.TrimSpace(line[idx:])
+		value, err := strconv.ParseFloat(valueStr, 64)
+		if err != nil {
+			continue
+		}
+		metricPart := strings.TrimSpace(line[:idx])
+		for i, sel := range selectors {
+			if !matched[i] && metricPart == sel {
+				values[i] = value
+				matched[i] = true
+				break
+			}
+		}
+	}
+	return values
+}
